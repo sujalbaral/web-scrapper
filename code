@@ -1,0 +1,273 @@
+import requests
+import threading
+import tkinter as tk
+from tkinter import ttk, messagebox, filedialog
+from bs4 import BeautifulSoup
+import re
+from datetime import datetime
+from urllib.parse import urljoin
+import csv
+import json
+import os
+from queue import Queue
+import time
+
+class WebCrawler:
+    def __init__(self, url, max_depth, output_format, output_text, progress_var, total_urls_var):
+        self.url = url
+        self.max_depth = max_depth
+        self.output_format = output_format
+        self.output_text = output_text
+        self.progress_var = progress_var
+        self.total_urls_var = total_urls_var
+        self.subdomains = set()
+        self.links = set()
+        self.jsfiles = set()
+        self.images = set()
+        self.cssfiles = set()
+        self.visited = set()
+        self.lock = threading.Lock()
+        self.stop_event = threading.Event()
+        self.queue = Queue()
+        self.max_threads = 10  # Limit the number of concurrent threads
+        self.thread_count = 0
+        self.setup_tags()
+
+    def setup_tags(self):
+        self.output_text.tag_configure("subdomain", foreground="red")
+        self.output_text.tag_configure("link", foreground="blue")
+        self.output_text.tag_configure("jsfile", foreground="green")
+        self.output_text.tag_configure("image", foreground="magenta")
+        self.output_text.tag_configure("cssfile", foreground="orange")
+        self.output_text.tag_configure("error", foreground="red")
+        self.output_text.tag_configure("info", foreground="black")
+
+    def start_crawling(self):
+        self.print_banner()
+        self.queue.put((self.url, 1))  # Add initial URL to queue
+        self.crawling_threads = []
+        for _ in range(self.max_threads):
+            thread = threading.Thread(target=self.worker)
+            thread.start()
+            self.crawling_threads.append(thread)
+
+    def worker(self):
+        while not self.queue.empty() and not self.stop_event.is_set():
+            url, depth = self.queue.get()
+            if depth > self.max_depth or url in self.visited:
+                self.queue.task_done()
+                continue
+
+            try:
+                response = requests.get(url, timeout=5, allow_redirects=True)
+                soup = BeautifulSoup(response.text, 'html.parser')
+                with self.lock:
+                    self.visited.add(url)
+                    self.total_urls_var.set(len(self.visited))
+            except requests.exceptions.RequestException as err:
+                self.output_text.insert(tk.END, f"[-] An error occurred: {err}\n", ("error",))
+                self.output_text.update()
+                self.queue.task_done()
+                continue
+
+            subdomain_query = fr"https?://([a-zA-Z0-9.-]+)"
+            with self.lock:
+                for link in soup.find_all('a'):
+                    link_text = link.get('href')
+                    if link_text:
+                        if re.match(subdomain_query, link_text):
+                            self.subdomains.add(link_text)
+                            self.output_text.insert(tk.END, f"Subdomain found: {link_text}\n", ("subdomain",))
+                        else:
+                            full_link = urljoin(url, link_text)
+                            if full_link not in self.visited and full_link != url:
+                                self.links.add(full_link)
+                                self.queue.put((full_link, depth + 1))
+                                self.output_text.insert(tk.END, f"Link found: {full_link}\n", ("link",))
+
+                for file in soup.find_all('script'):
+                    script_src = file.get('src')
+                    if script_src:
+                        full_src = urljoin(url, script_src)
+                        self.jsfiles.add(full_src)
+                        self.output_text.insert(tk.END, f"JS file found: {full_src}\n", ("jsfile",))
+
+                for img in soup.find_all('img'):
+                    img_src = img.get('src')
+                    if img_src:
+                        full_src = urljoin(url, img_src)
+                        self.images.add(full_src)
+                        self.output_text.insert(tk.END, f"Image found: {full_src}\n", ("image",))
+
+                for css in soup.find_all('link', rel='stylesheet'):
+                    css_href = css.get('href')
+                    if css_href:
+                        full_href = urljoin(url, css_href)
+                        self.cssfiles.add(full_href)
+                        self.output_text.insert(tk.END, f"CSS file found: {full_href}\n", ("cssfile",))
+
+            self.queue.task_done()
+            self.progress_var.set(f"Crawling {len(self.visited)} URLs...")
+            self.output_text.yview(tk.END)  # Scroll to the end of the output text
+            time.sleep(0.1)  # Small delay to reduce server load
+
+    def stop_crawling(self):
+        self.stop_event.set()
+        self.queue.join()
+        for thread in self.crawling_threads:
+            thread.join()
+
+    def print_banner(self):
+        banner_text = "-" * 80 + "\n"
+        banner_text += f"Recursive Web Crawler starting at {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}\n"
+        banner_text += "-" * 80 + "\n"
+        banner_text += f"[*] URL".ljust(20, " ") + " : " + self.url + "\n"
+        banner_text += f"[*] Max Depth".ljust(20, " ") + " : " + str(self.max_depth) + "\n"
+        banner_text += f"[*] Output Format".ljust(20, " ") + " : " + self.output_format + "\n"
+        banner_text += "-" * 80 + "\n"
+        self.output_text.insert(tk.END, banner_text, ("info",))
+        self.output_text.update()
+
+    def print_results(self):
+        if self.subdomains:
+            self._print_set(self.subdomains, "Subdomains", "subdomain")
+        if self.links:
+            self._print_set(self.links, "Links", "link")
+        if self.jsfiles:
+            self._print_set(self.jsfiles, "JS Files", "jsfile")
+        if self.images:
+            self._print_set(self.images, "Images", "image")
+        if self.cssfiles:
+            self._print_set(self.cssfiles, "CSS Files", "cssfile")
+
+    def _print_set(self, data_set, label, tag):
+        if data_set:
+            set_text = f"[+] {label}:\n"
+            for item in data_set:
+                set_text += f"    {item}\n"
+            set_text += "\n"
+            self.output_text.insert(tk.END, set_text, (tag,))
+            self.output_text.update()
+
+    def save_results(self):
+        output_file = filedialog.asksaveasfilename(defaultextension=f".{self.output_format}",
+                                                   filetypes=[("JSON Files", "*.json"),
+                                                              ("CSV Files", "*.csv")])
+        if not output_file:
+            return
+
+        results = {
+            "subdomains": list(self.subdomains),
+            "links": list(self.links),
+            "jsfiles": list(self.jsfiles),
+            "images": list(self.images),
+            "cssfiles": list(self.cssfiles),
+        }
+
+        if self.output_format == 'json':
+            with open(output_file, 'w') as file:
+                json.dump(results, file, indent=4)
+        elif self.output_format == 'csv':
+            with open(output_file, 'w', newline='') as file:
+                writer = csv.writer(file)
+                for key, value in results.items():
+                    writer.writerow([key])
+                    writer.writerows([[item] for item in value])
+                    writer.writerow([])
+
+        self.output_text.insert(tk.END, f"[+] Results saved to {output_file}\n", ("info",))
+        self.output_text.update()
+
+def start_crawl(crawler):
+    crawler.start_crawling()
+
+def create_gui():
+    root = tk.Tk()
+    root.title("Web Crawler")
+    root.geometry("600x600")
+
+    style = ttk.Style()
+    style.configure("TLabel", font=('Helvetica', 10))
+    style.configure("TButton", font=('Helvetica', 10))
+
+    # Create main frame
+    main_frame = ttk.Frame(root, padding=10)
+    main_frame.pack(fill="both", expand=True)
+
+    # URL Entry
+    url_label = ttk.Label(main_frame, text="URL:")
+    url_label.grid(row=0, column=0, sticky="w", padx=5, pady=5)
+    url_entry = ttk.Entry(main_frame, width=50)
+    url_entry.grid(row=0, column=1, padx=5, pady=5)
+
+    # Max Depth Entry
+    depth_label = ttk.Label(main_frame, text="Max Depth:")
+    depth_label.grid(row=1, column=0, sticky="w", padx=5, pady=5)
+    depth_entry = ttk.Entry(main_frame, width=10)
+    depth_entry.grid(row=1, column=1, padx=5, pady=5)
+
+    # Output Format
+    format_label = ttk.Label(main_frame, text="Output Format:")
+    format_label.grid(row=2, column=0, sticky="w", padx=5, pady=5)
+    format_var = tk.StringVar(value="txt")
+    format_options = ["txt", "json", "csv"]
+    format_menu = ttk.OptionMenu(main_frame, format_var, format_var.get(), *format_options)
+    format_menu.grid(row=2, column=1, padx=5, pady=5)
+
+    # Progress
+    progress_var = tk.StringVar(value="Crawling not started.")
+    progress_label = ttk.Label(main_frame, textvariable=progress_var)
+    progress_label.grid(row=3, column=0, columnspan=2, pady=5)
+
+    # Total URLs
+    total_urls_var = tk.IntVar(value=0)
+    total_urls_label = ttk.Label(main_frame, textvariable=total_urls_var)
+    total_urls_label.grid(row=4, column=0, columnspan=2, pady=5)
+
+    # Output Frame
+    output_frame = ttk.Frame(main_frame)
+    output_frame.grid(row=5, column=0, columnspan=2, pady=10)
+
+    output_text = tk.Text(output_frame, wrap="word", height=20, width=80)
+    output_text.pack(fill="both", expand=True)
+
+    # Button Frame
+    button_frame = ttk.Frame(main_frame)
+    button_frame.grid(row=6, column=0, columnspan=2, pady=10)
+
+    def on_start():
+        url = url_entry.get()
+        try:
+            max_depth = int(depth_entry.get())
+        except ValueError:
+            messagebox.showerror("Invalid Input", "Max Depth must be an integer.")
+            return
+        output_format = format_var.get()
+        global crawler
+        crawler = WebCrawler(url, max_depth, output_format, output_text, progress_var, total_urls_var)
+        start_crawl(crawler)
+
+    def on_stop():
+        if 'crawler' in globals():
+            crawler.stop_crawling()
+
+    def clear_screen():
+        output_text.delete(1.0, tk.END)
+
+    start_button = ttk.Button(button_frame, text="Start Crawling", command=on_start)
+    start_button.grid(row=0, column=0, padx=5)
+
+    stop_button = ttk.Button(button_frame, text="Stop Crawling", command=on_stop)
+    stop_button.grid(row=0, column=1, padx=5)
+
+    save_button = ttk.Button(button_frame, text="Save Results", command=lambda: crawler.save_results() if 'crawler' in globals() else None)
+    save_button.grid(row=0, column=2, padx=5)
+
+    clear_button = ttk.Button(button_frame, text="Clear Screen", command=clear_screen)
+    clear_button.grid(row=0, column=3, padx=5)
+
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    create_gui()
